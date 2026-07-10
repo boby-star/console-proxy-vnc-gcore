@@ -1,0 +1,8 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Serial Console</title><link rel="stylesheet" href="/static/xterm.css"></head><body><div id="status">Connecting</div><div id="terminal"></div><script src="/static/xterm.js"></script><script>
+const token = "{{ token }}"; const statusEl=document.getElementById('status'); const term=new Terminal(); term.open(document.getElementById('terminal')); term.writeln('Serial console');
+function setStatus(s){ statusEl.textContent=s; }
+const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:'; const ws = new WebSocket(`${scheme}//${location.host}/p/${token}/serial/ws`); ws.binaryType='arraybuffer';
+ws.onopen=()=>setStatus('Connected'); ws.onclose=()=>setStatus('Disconnected'); ws.onerror=()=>setStatus('Error');
+ws.onmessage=async ev=>{ if (ev.data instanceof ArrayBuffer) term.write(new TextDecoder().decode(ev.data)); else term.write(ev.data); };
+term.onData(data => { if (ws.readyState === WebSocket.OPEN) ws.send(data); });
+</script></body></html>
