@@ -4,7 +4,7 @@
 за допомогою Docker Compose. Стек складається з трьох контейнерів:
 
 ```text
-Інтернет => Bunny CDN (опціаонально) => Nginx => console-proxy => Redis
+Інтернет => Bunny CDN (опціонально) => Nginx => console-proxy => Redis
 ```
 
 - **Nginx** — єдина зовнішньо доступна точка: завершує TLS та проксіює HTTP/WebSocket.
@@ -13,7 +13,7 @@
 
 ## 1. Встановлення Docker і Git
 
-Якщо на сервері немає служб Docker, Compose або Gir - підключіться до сервера через SSH і виконайте:
+Якщо на сервері немає служб Docker, Compose або Git - підключіться до сервера через SSH і виконайте:
 
 ```bash
 sudo apt update
@@ -42,10 +42,9 @@ docker ps
 
 ## 2. Створення сертифікатів для домену
 
-До першого `docker compose up` certificate files **повинні вже існувати**. Якщо
-вони відсутні, сучасна Compose-конфігурація завершиться помилкою замість створення
-помилкових директорій із суфіксом `.pem`.
+До першого `docker compose up`файли сертифікатів **повинні вже існувати**.
 
+```bash
 sudo certbot certonly \
   --standalone \
   --email <ваш-робочий-email> \
@@ -69,7 +68,7 @@ sudo openssl pkey \
 
 ## 3. Клонування потрібної гілки
 
-Створіть каталог застосунку:
+Створіть каталог застосунку (назва і шлях довільні):
 
 ```bash
 sudo mkdir -p /opt/console-proxy
@@ -79,9 +78,7 @@ sudo chown "$USER":"$USER" /opt/console-proxy
 Для публічного репозиторію (зараз він публічний):
 
 ```bash
-git clone --branch transfer-to-docker-compose --single-branch \
-  https://github.com/boby-star/console-proxy.git \
-  /opt/console-proxy
+git clone --branch transfer-to-docker-compose --single-branch https://github.com/boby-star/console-proxy.git /opt/console-proxy
 ```
 
 ## 4. Production-конфігурація
@@ -103,7 +100,7 @@ PUBLIC_BASE_URL=https://remote-control.re
 # Сюди треба вставити секрет, який передаємо в модуль (з ним бекенд billmanager звертається до сервіса)
 REGISTER_API_TOKEN=REPLACE_WITH_A_LONG_RANDOM_SECRET
 
-# Це white-list. Сюди можна вносити домени які сервіс сприймає. Цю змінну можна масштабувати якщо будуть інші провайдери.
+# Це white-list доменів які віддає провайдер при підключенні (URL на VNC / IPMI тощо). Сюди можна вносити домени які сервіс сприймає. Цю змінну можна масштабувати якщо будуть інші провайдери.
 ALLOWED_HOST_SUFFIXES=cloud.gcore.com,ipmi.ovh.net
 SESSION_TTL_SECONDS=3000
 PREFETCH_PROVIDER_COOKIES=true
@@ -154,4 +151,31 @@ curl -fsS https://remote-control.re/ready
 
 ```json
 {"status":"ready"}
+```
+
+## 6. Оновлення контейнера 
+
+Оновлюйте лише контрольовану гілку:
+
+```bash
+cd /opt/console-proxy
+git fetch origin
+git switch transfer-to-docker-compose
+git pull --ff-only origin transfer-to-docker-compose
+
+docker compose up -d --build
+docker compose ps
+docker compose logs --tail=200
+```
+
+## 7. Сертифікати та renewal
+
+Якщо certificate випускався через `certbot --standalone` (в нашому випадку - так), порт `80` під час
+renewal не може бути зайнятий Nginx. Для ручного renewal:
+
+```bash
+cd /opt/console-proxy
+docker compose stop nginx
+sudo certbot renew
+docker compose up -d nginx
 ```
