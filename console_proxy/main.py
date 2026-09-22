@@ -8,8 +8,15 @@ from .cookies import ProviderCookieService
 from .handlers.health import HealthHandler
 from .handlers.novnc import NoVncConsoleHandler
 from .handlers.register import RegisterHandler
+from .handlers.register_dispatcher import ConsoleRegisterDispatcher
 from .handlers.serial import SerialConsoleHandler
 from .logging_utils import request_id_middleware, setup_logging
+from .ovh_ipmi.cookies import OvhIpmiCookieService
+from .ovh_ipmi.handlers import OvhIpmiConsoleHandler, OvhIpmiRegisterHandler
+from .ovh_ipmi.http_proxy import OvhIpmiHTTPProxy
+from .ovh_ipmi.lease import OvhIpmiLease
+from .ovh_ipmi.url_utils import OvhIpmiURLBuilder, OvhIpmiURLValidator
+from .ovh_ipmi.websocket_bridge import OvhIpmiWebSocketBridge
 from .proxy.http_proxy import HTTPProxyService
 from .proxy.websocket_bridge import WebSocketBridge
 from .security import ClaimService
@@ -37,8 +44,25 @@ async def init_services(app: web.Application) -> None:
     websocket_bridge = WebSocketBridge(config, builder, cookies)
     http_proxy = HTTPProxyService(config, builder, cookies)
 
+    ovh_validator = OvhIpmiURLValidator()
+    ovh_builder = OvhIpmiURLBuilder(config.public_base_url, ovh_validator)
+    ovh_cookies = OvhIpmiCookieService(redis_client, config)
+    ovh_lease = OvhIpmiLease(redis_client, config)
+    ovh_http_proxy = OvhIpmiHTTPProxy(
+        config, ovh_builder, ovh_cookies, ovh_lease
+    )
+    ovh_websocket_bridge = OvhIpmiWebSocketBridge(
+        config, ovh_builder, ovh_cookies, ovh_lease
+    )
+    ovh_register_handler = OvhIpmiRegisterHandler(
+        config, ovh_validator, ovh_builder, store, ovh_cookies
+    )
+
     app["register_handler"] = RegisterHandler(
         config, ConsoleModeDetector(), validator, builder, store, cookies
+    )
+    app["register_dispatcher"] = ConsoleRegisterDispatcher(
+        app["register_handler"], ovh_register_handler
     )
     app["health_handler"] = HealthHandler()
     app["novnc_handler"] = NoVncConsoleHandler(
@@ -46,6 +70,9 @@ async def init_services(app: web.Application) -> None:
     )
     app["serial_handler"] = SerialConsoleHandler(
         config, store, validator, claims, websocket_bridge
+    )
+    app["ovh_ipmi_handler"] = OvhIpmiConsoleHandler(
+        store, ovh_validator, claims, ovh_http_proxy, ovh_websocket_bridge
     )
 
 
@@ -77,7 +104,7 @@ def create_app() -> web.Application:
         return await request.app["health_handler"].ready(request)
 
     async def register(request: web.Request) -> web.Response:
-        return await request.app["register_handler"](request)
+        return await request.app["register_dispatcher"](request)
 
     async def serial_page(request: web.Request) -> web.Response:
         return await request.app["serial_handler"].page(request)
@@ -88,11 +115,16 @@ def create_app() -> web.Application:
     async def novnc(request: web.Request) -> web.StreamResponse:
         return await request.app["novnc_handler"].handle(request)
 
+    async def ovh_ipmi(request: web.Request) -> web.StreamResponse:
+        return await request.app["ovh_ipmi_handler"].handle(request)
+
     app.router.add_get("/health", health)
     app.router.add_get("/ready", ready)
     app.router.add_post("/api/console/register", register)
     app.router.add_get("/p/{token}/serial", serial_page)
     app.router.add_get("/p/{token}/serial/ws", serial_ws)
+    app.router.add_route("*", "/ipmi/{token}/{tail:.*}", ovh_ipmi)
+    app.router.add_route("*", "/ipmi/{token}", ovh_ipmi)
     app.router.add_route("*", "/p/{token}/{tail:.*}", novnc)
     app.router.add_route("*", "/p/{token}", novnc)
     return app

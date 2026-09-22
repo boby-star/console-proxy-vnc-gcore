@@ -1,0 +1,1 @@
+"""OVH HTML5 IPMI console support, isolated from the legacy VNC flow."""
