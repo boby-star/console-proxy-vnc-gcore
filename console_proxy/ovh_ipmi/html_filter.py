@@ -1,4 +1,9 @@
 import json
+import re
+
+
+QUOTED_ROOT_URL = re.compile(rb"(?P<quote>[\"'])(?P<path>/(?!/)[^\"'\\\s<>]*)")
+CSS_ROOT_URL = re.compile(rb"(?P<prefix>url\(\s*)(?P<quote>[\"']?)(?P<path>/(?!/)[^\"')\s<>]*)")
 
 
 BOOTSTRAP = """<style id="console-ipmi-ui">
@@ -7,6 +12,35 @@ BOOTSTRAP = """<style id="console-ipmi-ui">
 (function(){
   const proxyPrefix=__PROXY_PREFIX__;
   const upstreamHost=__UPSTREAM_HOST__;
+  function proxyHttpUrl(value){
+    const target=new URL(value,window.location.href);
+    if(target.hostname===upstreamHost){
+      target.protocol=window.location.protocol;
+      target.host=window.location.host;
+    }
+    if(target.origin===window.location.origin && !target.pathname.startsWith(proxyPrefix+'/')){
+      target.pathname=proxyPrefix+(target.pathname.startsWith('/')?'':'/')+target.pathname;
+    }
+    return target.toString();
+  }
+
+  const nativeFetch=window.fetch;
+  if(nativeFetch){
+    window.fetch=function(input,options){
+      if(typeof input==='string' || input instanceof URL){
+        input=proxyHttpUrl(input);
+      }else if(input instanceof Request){
+        input=new Request(proxyHttpUrl(input.url),input);
+      }
+      return nativeFetch.call(this,input,options);
+    };
+  }
+  const nativeXhrOpen=XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open=function(method,url){
+    const args=Array.prototype.slice.call(arguments,2);
+    return nativeXhrOpen.call(this,method,proxyHttpUrl(url),...args);
+  };
+
   const NativeWebSocket=window.WebSocket;
   function ProxyWebSocket(url,protocols){
     const target=new URL(url,window.location.href);
@@ -40,10 +74,31 @@ BOOTSTRAP = """<style id="console-ipmi-ui">
 </script>"""
 
 
+def rewrite_root_relative_urls(body, token):
+    """Move provider root URLs below this IPMI session's public namespace."""
+    prefix = f"/ipmi/{token}".encode("ascii")
+
+    def replace_quoted(match):
+        path = match.group("path")
+        if path == b"/" or path == prefix or path.startswith(prefix + b"/"):
+            return match.group(0)
+        return match.group("quote") + prefix + path
+
+    def replace_css(match):
+        path = match.group("path")
+        if path == b"/" or path == prefix or path.startswith(prefix + b"/"):
+            return match.group(0)
+        return match.group("prefix") + match.group("quote") + prefix + path
+
+    body = QUOTED_ROOT_URL.sub(replace_quoted, body)
+    return CSS_ROOT_URL.sub(replace_css, body)
+
+
 def filter_html(body, token, upstream_hostname):
     script = BOOTSTRAP.replace("__PROXY_PREFIX__", json.dumps(f"/ipmi/{token}"))
     script = script.replace("__UPSTREAM_HOST__", json.dumps(upstream_hostname))
     injected = script.encode("utf-8")
+    body = rewrite_root_relative_urls(body, token)
     lower = body.lower()
     head = lower.find(b"<head")
     if head >= 0:
