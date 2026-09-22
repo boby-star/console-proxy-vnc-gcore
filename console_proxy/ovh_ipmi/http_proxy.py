@@ -4,7 +4,7 @@ from urllib.parse import urlsplit
 from aiohttp import ClientError, ClientSession, DummyCookieJar, web
 
 from ..logging_utils import safe_url
-from .html_filter import filter_html
+from .html_filter import filter_html, rewrite_root_relative_urls
 
 
 HOP_HEADERS = {
@@ -71,18 +71,32 @@ class OvhIpmiHTTPProxy:
                             samesite="None",
                         )
 
-                    is_html = (
-                        upstream.headers.get("Content-Type", "").lower().startswith("text/html")
+                    content_type = upstream.headers.get("Content-Type", "").lower()
+                    is_html = content_type.startswith("text/html")
+                    is_rewritable_asset = (
+                        content_type.startswith("text/css")
+                        or "javascript" in content_type
+                        or target.split("?", 1)[0].endswith((".js", ".css"))
+                    )
+                    rewrite_body = (
+                        (is_html or is_rewritable_asset)
                         and not upstream.headers.get("Content-Encoding")
                     )
-                    if is_html:
+                    if rewrite_body:
                         hostname = urlsplit(session.upstream_url).hostname
-                        body = filter_html(await upstream.read(), token, hostname)
+                        body = await upstream.read()
+                        if is_html:
+                            body = filter_html(body, token, hostname)
+                        else:
+                            body = rewrite_root_relative_urls(body, token)
                         response.headers.pop("Content-Length", None)
+                        response.headers.pop("ETag", None)
+                        response.headers.pop("Content-MD5", None)
+                        response.headers.pop("Accept-Ranges", None)
                         response.content_length = len(body)
 
                     await response.prepare(request)
-                    if is_html:
+                    if rewrite_body:
                         await response.write(body)
                     else:
                         async for chunk in upstream.content.iter_chunked(65536):
