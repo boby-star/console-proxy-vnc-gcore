@@ -23,7 +23,7 @@ class OvhIpmiRegisterHandler:
         ):
             log.warning("auth_failure")
             raise web.HTTPUnauthorized(text="Invalid proxy token")
-        upstream = payload.get("upstream_url") or payload.get("url")
+        upstream = payload.get("upstream_url")
         if not upstream:
             raise web.HTTPBadRequest(text="upstream_url is required")
         self.validator.validate(upstream)
@@ -33,7 +33,6 @@ class OvhIpmiRegisterHandler:
             self.config.session_ttl_seconds,
         )
         await self.store.save(token, session, log)
-        await self.cookies.prefetch(token, upstream, log)
         public_url = self.url_builder.build_public_url(token, upstream)
         log.info(
             "ovh_ipmi_register_success",
@@ -44,7 +43,7 @@ class OvhIpmiRegisterHandler:
             "token": token,
             "url": public_url,
             "ttl": self.config.session_ttl_seconds,
-            "type": "ipmi",
+            "type": "ovh_ipmi",
         })
 
 
@@ -60,7 +59,7 @@ class OvhIpmiConsoleHandler:
         token = request.match_info["token"]
         log = RequestLogger(request)
         session = await self.store.load(token, log)
-        if session.mode != "ipmi" or session.provider.lower() != "ovh":
+        if session.mode != "ipmi":
             raise web.HTTPForbidden(text="Invalid OVH IPMI session")
         self.validator.validate(session.upstream_url)
         if request.headers.get("Upgrade", "").lower() == "websocket":

@@ -6,18 +6,13 @@ QUOTED_ROOT_URL = re.compile(rb"(?P<quote>[\"'])(?P<path>/(?!/)[^\"'\\\s<>]*)")
 CSS_ROOT_URL = re.compile(rb"(?P<prefix>url\(\s*)(?P<quote>[\"']?)(?P<path>/(?!/)[^\"')\s<>]*)")
 
 
-BOOTSTRAP = """<base href=__PROXY_BASE__><style id="console-proxy-ovh-ipmi-ui">
+BOOTSTRAP = """<base href=__PROXY_BASE__><style id="console-proxy-ui">
 #button_active_user,#button_help{display:none!important}
 </style><script>
 (function(){
   const proxyPrefix=__PROXY_PREFIX__;
-  const upstreamHost=__UPSTREAM_HOST__;
   function proxyHttpUrl(value){
     const target=new URL(value,window.location.href);
-    if(target.hostname===upstreamHost){
-      target.protocol=window.location.protocol;
-      target.host=window.location.host;
-    }
     if(target.origin===window.location.origin && !target.pathname.startsWith(proxyPrefix+'/')){
       target.pathname=proxyPrefix+(target.pathname.startsWith('/')?'':'/')+target.pathname;
     }
@@ -66,13 +61,10 @@ BOOTSTRAP = """<base href=__PROXY_BASE__><style id="console-proxy-ovh-ipmi-ui">
   const NativeWebSocket=window.WebSocket;
   function ProxyWebSocket(url,protocols){
     const target=new URL(url,window.location.href);
-    if((target.protocol==='ws:' || target.protocol==='wss:') &&
-       (target.hostname===upstreamHost || target.host===window.location.host)){
-      target.protocol=window.location.protocol==='https:'?'wss:':'ws:';
-      target.host=window.location.host;
-      if(!target.pathname.startsWith(proxyPrefix+'/')){
-        target.pathname=proxyPrefix+(target.pathname.startsWith('/')?'':'/')+target.pathname;
-      }
+    target.protocol=window.location.protocol==='https:'?'wss:':'ws:';
+    target.host=window.location.host;
+    if(!target.pathname.startsWith(proxyPrefix+'/')){
+      target.pathname=proxyPrefix+(target.pathname.startsWith('/')?'':'/')+target.pathname;
     }
     return protocols===undefined?new NativeWebSocket(target):new NativeWebSocket(target,protocols);
   }
@@ -135,12 +127,28 @@ def rewrite_root_relative_urls(body, token):
     return CSS_ROOT_URL.sub(replace_css, body)
 
 
-def filter_html(body, token, upstream_hostname):
+def rewrite_provider_identity(body, token, upstream_netloc, public_host):
+    """Remove the provider address from content while preserving proxy routing."""
+    prefix = f"/ipmi/{token}".encode("ascii")
+    netloc = upstream_netloc.encode("ascii")
+    absolute_url = re.compile(
+        rb"(?:https?|wss?)://" + re.escape(netloc) + rb"(?P<path>/[^\"'\\\s<>]*)?",
+        re.IGNORECASE,
+    )
+
+    def replace_absolute(match):
+        return prefix + (match.group("path") or b"/")
+
+    body = absolute_url.sub(replace_absolute, body)
+    return re.sub(re.escape(netloc), public_host.encode("ascii"), body, flags=re.IGNORECASE)
+
+
+def filter_html(body, token, upstream_netloc, public_host):
     prefix = f"/ipmi/{token}"
     script = BOOTSTRAP.replace("__PROXY_BASE__", json.dumps(prefix + "/"))
     script = script.replace("__PROXY_PREFIX__", json.dumps(prefix))
-    script = script.replace("__UPSTREAM_HOST__", json.dumps(upstream_hostname))
     injected = script.encode("utf-8")
+    body = rewrite_provider_identity(body, token, upstream_netloc, public_host)
     body = rewrite_root_relative_urls(body, token)
     lower = body.lower()
     head = lower.find(b"<head")

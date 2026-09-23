@@ -4,7 +4,7 @@ from urllib.parse import urlsplit
 from aiohttp import ClientError, ClientSession, DummyCookieJar, web
 
 from ..logging_utils import safe_url
-from .html_filter import filter_html, rewrite_root_relative_urls
+from .html_filter import filter_html, rewrite_provider_identity, rewrite_root_relative_urls
 
 
 HOP_HEADERS = {
@@ -28,8 +28,12 @@ def classify_rewritable_response(content_type, target_url):
     is_asset = (
         media_type == "text/css"
         or "javascript" in media_type
+        or media_type.startswith("text/")
+        or media_type in ("application/json", "application/xml", "application/xhtml+xml")
+        or media_type.endswith("+json")
+        or media_type.endswith("+xml")
         or path.endswith((".js", ".css"))
-    )
+    ) and not is_html
     return is_html, is_asset
 
 
@@ -43,6 +47,7 @@ class OvhIpmiHTTPProxy:
     async def proxy(self, request, token, session, set_claim_cookie, claim_id, log):
         await self.lease.refresh(token)
         target = self.url_builder.make_upstream_url(session.upstream_url, request, token)
+        public_host = urlsplit(self.config.public_base_url).netloc
         started = time.monotonic()
         log.info("ovh_ipmi_http_start", upstream=safe_url(target))
         cookie = await self.cookies.build_header(token, request.headers.get("Cookie"))
@@ -64,7 +69,7 @@ class OvhIpmiHTTPProxy:
                     set_cookies = upstream.headers.getall("Set-Cookie", [])
                     await self.cookies.save(token, set_cookies)
                     response_headers = self._response_headers(
-                        upstream.headers, token, session.upstream_url
+                        upstream.headers, token, session.upstream_url, public_host
                     )
                     response = web.StreamResponse(
                         status=upstream.status,
@@ -94,11 +99,16 @@ class OvhIpmiHTTPProxy:
                         and not upstream.headers.get("Content-Encoding")
                     )
                     if rewrite_body:
-                        hostname = urlsplit(session.upstream_url).hostname
+                        upstream_netloc = urlsplit(session.upstream_url).netloc
                         body = await upstream.read()
                         if is_html:
-                            body = filter_html(body, token, hostname)
+                            body = filter_html(
+                                body, token, upstream_netloc, public_host
+                            )
                         else:
+                            body = rewrite_provider_identity(
+                                body, token, upstream_netloc, public_host
+                            )
                             body = rewrite_root_relative_urls(body, token)
                         response.headers.pop("Content-Length", None)
                         response.headers.pop("ETag", None)
@@ -144,12 +154,17 @@ class OvhIpmiHTTPProxy:
             headers["Cookie"] = cookie
         return headers
 
-    def _response_headers(self, headers, token, upstream_url):
+    def _response_headers(self, headers, token, upstream_url, public_host):
         result = {}
+        upstream_netloc = urlsplit(upstream_url).netloc
         for key, value in headers.items():
-            if key.lower() in RESPONSE_SKIP:
+            if key.lower() in RESPONSE_SKIP | {
+                "server", "via", "x-powered-by", "alt-svc", "report-to", "nel",
+            }:
                 continue
             if key.lower() == "location":
                 value = self.url_builder.rewrite_location(value, token, upstream_url)
+            else:
+                value = value.replace(upstream_netloc, public_host)
             result[key] = value
         return result
