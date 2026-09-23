@@ -6,7 +6,7 @@ QUOTED_ROOT_URL = re.compile(rb"(?P<quote>[\"'])(?P<path>/(?!/)[^\"'\\\s<>]*)")
 CSS_ROOT_URL = re.compile(rb"(?P<prefix>url\(\s*)(?P<quote>[\"']?)(?P<path>/(?!/)[^\"')\s<>]*)")
 
 
-BOOTSTRAP = """<style id="console-ipmi-ui">
+BOOTSTRAP = """<base href=__PROXY_BASE__><style id="console-proxy-ovh-ipmi-ui">
 #button_active_user,#button_help{display:none!important}
 </style><script>
 (function(){
@@ -41,6 +41,28 @@ BOOTSTRAP = """<style id="console-ipmi-ui">
     return nativeXhrOpen.call(this,method,proxyHttpUrl(url),...args);
   };
 
+  const NativeWorker=window.Worker;
+  if(NativeWorker){
+    window.Worker=function(url,options){
+      return new NativeWorker(proxyHttpUrl(url),options);
+    };
+    window.Worker.prototype=NativeWorker.prototype;
+  }
+  const NativeSharedWorker=window.SharedWorker;
+  if(NativeSharedWorker){
+    window.SharedWorker=function(url,options){
+      return new NativeSharedWorker(proxyHttpUrl(url),options);
+    };
+    window.SharedWorker.prototype=NativeSharedWorker.prototype;
+  }
+  const NativeEventSource=window.EventSource;
+  if(NativeEventSource){
+    window.EventSource=function(url,options){
+      return new NativeEventSource(proxyHttpUrl(url),options);
+    };
+    window.EventSource.prototype=NativeEventSource.prototype;
+  }
+
   const NativeWebSocket=window.WebSocket;
   function ProxyWebSocket(url,protocols){
     const target=new URL(url,window.location.href);
@@ -61,15 +83,34 @@ BOOTSTRAP = """<style id="console-ipmi-ui">
   window.WebSocket=ProxyWebSocket;
 
   const hiddenIds=['button_active_user','button_help'];
-  function removeHiddenControls(){
+  const urlAttributes=['src','href','action','data-main'];
+  function rewriteElementUrls(root){
+    if(!root || root.nodeType!==Node.ELEMENT_NODE){ return; }
+    const elements=[root].concat(Array.from(root.querySelectorAll('[src],[href],[action],[data-main]')));
+    elements.forEach(function(element){
+      urlAttributes.forEach(function(attribute){
+        const value=element.getAttribute(attribute);
+        if(!value || value.startsWith('#') || value.startsWith('data:') || value.startsWith('javascript:')){
+          return;
+        }
+        element.setAttribute(attribute,proxyHttpUrl(value));
+      });
+    });
+  }
+  function maintainDocument(root){
     hiddenIds.forEach(function(id){
       const element=document.getElementById(id);
       if(element) element.remove();
     });
+    rewriteElementUrls(root || document.documentElement);
   }
-  document.addEventListener('DOMContentLoaded',removeHiddenControls);
-  new MutationObserver(removeHiddenControls).observe(document.documentElement,{childList:true,subtree:true});
-  removeHiddenControls();
+  document.addEventListener('DOMContentLoaded',function(){ maintainDocument(document.documentElement); });
+  new MutationObserver(function(mutations){
+    mutations.forEach(function(mutation){
+      mutation.addedNodes.forEach(maintainDocument);
+    });
+  }).observe(document.documentElement,{childList:true,subtree:true});
+  maintainDocument(document.documentElement);
 })();
 </script>"""
 
@@ -95,7 +136,9 @@ def rewrite_root_relative_urls(body, token):
 
 
 def filter_html(body, token, upstream_hostname):
-    script = BOOTSTRAP.replace("__PROXY_PREFIX__", json.dumps(f"/ipmi/{token}"))
+    prefix = f"/ipmi/{token}"
+    script = BOOTSTRAP.replace("__PROXY_BASE__", json.dumps(prefix + "/"))
+    script = script.replace("__PROXY_PREFIX__", json.dumps(prefix))
     script = script.replace("__UPSTREAM_HOST__", json.dumps(upstream_hostname))
     injected = script.encode("utf-8")
     body = rewrite_root_relative_urls(body, token)
