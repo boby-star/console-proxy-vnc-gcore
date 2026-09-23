@@ -18,6 +18,21 @@ RESPONSE_SKIP = HOP_HEADERS | {
 }
 
 
+def classify_rewritable_response(content_type, target_url):
+    """Identify provider text assets even when the BMC sends a generic MIME type."""
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    path = urlsplit(target_url).path.lower()
+    is_html = media_type in ("text/html", "application/xhtml+xml") or path.endswith(
+        (".html", ".htm")
+    )
+    is_asset = (
+        media_type == "text/css"
+        or "javascript" in media_type
+        or path.endswith((".js", ".css"))
+    )
+    return is_html, is_asset
+
+
 class OvhIpmiHTTPProxy:
     def __init__(self, config, url_builder, cookies, lease):
         self.config = config
@@ -71,12 +86,8 @@ class OvhIpmiHTTPProxy:
                             samesite="None",
                         )
 
-                    content_type = upstream.headers.get("Content-Type", "").lower()
-                    is_html = content_type.startswith("text/html")
-                    is_rewritable_asset = (
-                        content_type.startswith("text/css")
-                        or "javascript" in content_type
-                        or target.split("?", 1)[0].endswith((".js", ".css"))
+                    is_html, is_rewritable_asset = classify_rewritable_response(
+                        upstream.headers.get("Content-Type", ""), target
                     )
                     rewrite_body = (
                         (is_html or is_rewritable_asset)
@@ -93,6 +104,11 @@ class OvhIpmiHTTPProxy:
                         response.headers.pop("ETag", None)
                         response.headers.pop("Content-MD5", None)
                         response.headers.pop("Accept-Ranges", None)
+                        response.headers.pop("Last-Modified", None)
+                        response.headers["Cache-Control"] = "no-store"
+                        response.headers["X-Console-Proxy-Rewritten"] = (
+                            "html" if is_html else "asset"
+                        )
                         response.content_length = len(body)
 
                     await response.prepare(request)

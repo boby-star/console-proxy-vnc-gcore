@@ -1,72 +1,111 @@
-import secrets
-
-from aiohttp import web
-
-from ..logging_utils import RequestLogger, mask_token, safe_url
-from ..models import ConsoleSession
+import json
+import re
 
 
-class OvhIpmiRegisterHandler:
-    def __init__(self, config, validator, url_builder, store, cookies):
-        self.config = config
-        self.validator = validator
-        self.url_builder = url_builder
-        self.store = store
-        self.cookies = cookies
-
-    async def __call__(self, request, payload):
-        log = RequestLogger(request)
-        log.info("ovh_ipmi_register_start")
-        if (
-            self.config.register_api_token
-            and request.headers.get("X-Proxy-Token") != self.config.register_api_token
-        ):
-            log.warning("auth_failure")
-            raise web.HTTPUnauthorized(text="Invalid proxy token")
-        upstream = payload.get("upstream_url") or payload.get("url")
-        if not upstream:
-            raise web.HTTPBadRequest(text="upstream_url is required")
-        self.validator.validate(upstream)
-        token = secrets.token_urlsafe(24)
-        session = ConsoleSession.create(
-            "ipmi", "ovh", upstream,
-            self.config.session_ttl_seconds,
-        )
-        await self.store.save(token, session, log)
-        await self.cookies.prefetch(token, upstream, log)
-        public_url = self.url_builder.build_public_url(token, upstream)
-        log.info(
-            "ovh_ipmi_register_success",
-            token=mask_token(token),
-            upstream=safe_url(upstream),
-        )
-        return web.json_response({
-            "token": token,
-            "url": public_url,
-            "ttl": self.config.session_ttl_seconds,
-            "type": "ipmi",
-        })
+QUOTED_ROOT_URL = re.compile(rb"(?P<quote>[\"'])(?P<path>/(?!/)[^\"'\\\s<>]*)")
+CSS_ROOT_URL = re.compile(rb"(?P<prefix>url\(\s*)(?P<quote>[\"']?)(?P<path>/(?!/)[^\"')\s<>]*)")
 
 
-class OvhIpmiConsoleHandler:
-    def __init__(self, store, validator, claims, http_proxy, websocket_bridge):
-        self.store = store
-        self.validator = validator
-        self.claims = claims
-        self.http_proxy = http_proxy
-        self.websocket_bridge = websocket_bridge
+BOOTSTRAP = """<style id="console-ipmi-ui">
+#button_active_user,#button_help{display:none!important}
+</style><script>
+(function(){
+  const proxyPrefix=__PROXY_PREFIX__;
+  const upstreamHost=__UPSTREAM_HOST__;
+  function proxyHttpUrl(value){
+    const target=new URL(value,window.location.href);
+    if(target.hostname===upstreamHost){
+      target.protocol=window.location.protocol;
+      target.host=window.location.host;
+    }
+    if(target.origin===window.location.origin && !target.pathname.startsWith(proxyPrefix+'/')){
+      target.pathname=proxyPrefix+(target.pathname.startsWith('/')?'':'/')+target.pathname;
+    }
+    return target.toString();
+  }
 
-    async def handle(self, request):
-        token = request.match_info["token"]
-        log = RequestLogger(request)
-        session = await self.store.load(token, log)
-        if session.mode != "ipmi" or session.provider.lower() != "ovh":
-            raise web.HTTPForbidden(text="Invalid OVH IPMI session")
-        self.validator.validate(session.upstream_url)
-        if request.headers.get("Upgrade", "").lower() == "websocket":
-            await self.claims.require_existing_claim(request, token, log)
-            return await self.websocket_bridge.bridge(request, token, session, log)
-        should_set_claim, claim_id = await self.claims.ensure_claimed(request, token, log)
-        return await self.http_proxy.proxy(
-            request, token, session, should_set_claim, claim_id, log
-        )
+  const nativeFetch=window.fetch;
+  if(nativeFetch){
+    window.fetch=function(input,options){
+      if(typeof input==='string' || input instanceof URL){
+        input=proxyHttpUrl(input);
+      }else if(input instanceof Request){
+        input=new Request(proxyHttpUrl(input.url),input);
+      }
+      return nativeFetch.call(this,input,options);
+    };
+  }
+  const nativeXhrOpen=XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open=function(method,url){
+    const args=Array.prototype.slice.call(arguments,2);
+    return nativeXhrOpen.call(this,method,proxyHttpUrl(url),...args);
+  };
+
+  const NativeWebSocket=window.WebSocket;
+  function ProxyWebSocket(url,protocols){
+    const target=new URL(url,window.location.href);
+    if((target.protocol==='ws:' || target.protocol==='wss:') &&
+       (target.hostname===upstreamHost || target.host===window.location.host)){
+      target.protocol=window.location.protocol==='https:'?'wss:':'ws:';
+      target.host=window.location.host;
+      if(!target.pathname.startsWith(proxyPrefix+'/')){
+        target.pathname=proxyPrefix+(target.pathname.startsWith('/')?'':'/')+target.pathname;
+      }
+    }
+    return protocols===undefined?new NativeWebSocket(target):new NativeWebSocket(target,protocols);
+  }
+  ProxyWebSocket.prototype=NativeWebSocket.prototype;
+  ['CONNECTING','OPEN','CLOSING','CLOSED'].forEach(function(name){
+    Object.defineProperty(ProxyWebSocket,name,{value:NativeWebSocket[name]});
+  });
+  window.WebSocket=ProxyWebSocket;
+
+  const hiddenIds=['button_active_user','button_help'];
+  function removeHiddenControls(){
+    hiddenIds.forEach(function(id){
+      const element=document.getElementById(id);
+      if(element) element.remove();
+    });
+  }
+  document.addEventListener('DOMContentLoaded',removeHiddenControls);
+  new MutationObserver(removeHiddenControls).observe(document.documentElement,{childList:true,subtree:true});
+  removeHiddenControls();
+})();
+</script>"""
+
+
+def rewrite_root_relative_urls(body, token):
+    """Move provider root URLs below this IPMI session's public namespace."""
+    prefix = f"/ipmi/{token}".encode("ascii")
+
+    def replace_quoted(match):
+        path = match.group("path")
+        if path == b"/" or path == prefix or path.startswith(prefix + b"/"):
+            return match.group(0)
+        return match.group("quote") + prefix + path
+
+    def replace_css(match):
+        path = match.group("path")
+        if path == b"/" or path == prefix or path.startswith(prefix + b"/"):
+            return match.group(0)
+        return match.group("prefix") + match.group("quote") + prefix + path
+
+    body = QUOTED_ROOT_URL.sub(replace_quoted, body)
+    return CSS_ROOT_URL.sub(replace_css, body)
+
+
+def filter_html(body, token, upstream_hostname):
+    script = BOOTSTRAP.replace("__PROXY_PREFIX__", json.dumps(f"/ipmi/{token}"))
+    script = script.replace("__UPSTREAM_HOST__", json.dumps(upstream_hostname))
+    injected = script.encode("utf-8")
+    body = rewrite_root_relative_urls(body, token)
+    lower = body.lower()
+    head = lower.find(b"<head")
+    if head >= 0:
+        head_end = lower.find(b">", head)
+        if head_end >= 0:
+            return body[:head_end + 1] + injected + body[head_end + 1:]
+    body_end = lower.find(b"</body>")
+    if body_end >= 0:
+        return body[:body_end] + injected + body[body_end:]
+    return injected + body
