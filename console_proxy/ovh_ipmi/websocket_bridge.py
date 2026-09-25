@@ -2,22 +2,25 @@ import asyncio
 import time
 from urllib.parse import urlsplit
 
-from aiohttp import ClientError, ClientSession, DummyCookieJar, WSMsgType, WSServerHandshakeError, web
+from aiohttp import ClientError, WSMsgType, WSServerHandshakeError, web
 
 from ..logging_utils import safe_url
+from .browser_session import IPMI_BROWSER_COOKIE
 
 
 class OvhIpmiWebSocketBridge:
-    def __init__(self, config, url_builder, cookies, lease):
+    def __init__(self, config, url_builder, cookies, lease, client):
         self.config = config
         self.url_builder = url_builder
         self.cookies = cookies
         self.lease = lease
+        self.client = client
 
-    async def bridge(self, request, token, session, log):
-        await self.lease.refresh(token)
+    async def bridge(self, request, token, session, log, prefixed=True):
+        browser_id = request.cookies.get(IPMI_BROWSER_COOKIE)
+        await self.lease.refresh(token, browser_id)
         target = self.url_builder.make_upstream_url(
-            session.upstream_url, request, token, websocket=True
+            session.upstream_url, request, token, websocket=True, prefixed=prefixed
         )
         cookie = await self.cookies.build_header(token, request.headers.get("Cookie"))
         headers = self._headers(request, session.upstream_url, cookie)
@@ -28,35 +31,34 @@ class OvhIpmiWebSocketBridge:
             attempt_protocols=protocols or "none",
         )
         try:
-            async with ClientSession(
-                timeout=self.config.http_timeout,
-                cookie_jar=DummyCookieJar(),
-            ) as client_session:
-                kwargs = {
-                    "headers": headers,
-                    "heartbeat": 30,
-                    "max_msg_size": 0,
-                }
-                if protocols:
-                    kwargs["protocols"] = protocols
-                async with client_session.ws_connect(target, **kwargs) as upstream:
-                    await self.cookies.save(
-                        token, upstream._response.headers.getall("Set-Cookie", [])
-                    )
-                    downstream_protocols = (upstream.protocol,) if upstream.protocol else ()
-                    downstream = web.WebSocketResponse(
-                        heartbeat=30,
-                        max_msg_size=0,
-                        protocols=downstream_protocols,
-                    )
-                    for header in await self.cookies.stored_for_client(token):
-                        downstream.headers.add("Set-Cookie", header)
-                    await downstream.prepare(request)
-                    log.info(
-                        "ovh_ipmi_ws_connect_success",
-                        selected_subprotocol=upstream.protocol,
-                    )
-                    return await self._pump(downstream, upstream, token, log)
+            kwargs = {
+                "headers": headers,
+                "heartbeat": 30,
+                "max_msg_size": 0,
+                "compress": 0,
+            }
+            if protocols:
+                kwargs["protocols"] = protocols
+            async with self.client.ws_connect(target, **kwargs) as upstream:
+                await self.cookies.save(
+                    token, upstream._response.headers.getall("Set-Cookie", [])
+                )
+                downstream_protocols = (
+                    (upstream.protocol,) if upstream.protocol else ()
+                )
+                downstream = web.WebSocketResponse(
+                    heartbeat=30,
+                    max_msg_size=0,
+                    protocols=downstream_protocols,
+                )
+                await downstream.prepare(request)
+                log.info(
+                    "ovh_ipmi_ws_connect_success",
+                    selected_subprotocol=upstream.protocol,
+                )
+                return await self._pump(
+                    downstream, upstream, token, browser_id, log
+                )
         except WSServerHandshakeError as error:
             log.warning(
                 "ovh_ipmi_ws_connect_failure",
@@ -71,9 +73,9 @@ class OvhIpmiWebSocketBridge:
             log.exception("ovh_ipmi_ws_connect_failure", upstream=safe_url(target))
             raise web.HTTPBadGateway(text="Upstream IPMI WebSocket connection failed")
 
-    async def _pump(self, downstream, upstream, token, log):
+    async def _pump(self, downstream, upstream, token, browser_id, log):
         started = time.monotonic()
-        lease_task = asyncio.create_task(self.lease.maintain(token))
+        lease_task = asyncio.create_task(self.lease.maintain(token, browser_id))
 
         async def client_to_upstream():
             async for message in downstream:

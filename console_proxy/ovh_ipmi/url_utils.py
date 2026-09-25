@@ -36,16 +36,24 @@ class OvhIpmiURLBuilder:
         query = urlencode(parse_qsl(parsed.query, keep_blank_values=True))
         return f"{self.public_base_url}{path}" + (f"?{query}" if query else "")
 
-    def make_upstream_url(self, upstream_url, request, token, websocket=False):
+    def make_upstream_url(
+        self, upstream_url, request, token, websocket=False, prefixed=True
+    ):
         parsed = urlsplit(upstream_url)
         prefix = f"/ipmi/{token}"
         raw_path = request.rel_url.raw_path
-        if not raw_path.startswith(prefix):
-            raise web.HTTPBadRequest(text="Invalid IPMI proxy path")
-        path = raw_path[len(prefix):] or "/"
+        if prefixed:
+            if not raw_path.startswith(prefix):
+                raise web.HTTPBadRequest(text="Invalid IPMI proxy path")
+            path = raw_path[len(prefix):] or "/"
+        else:
+            path = raw_path or "/"
         if not path.startswith("/"):
             path = "/" + path
-        query = parsed.query if not websocket and path == (parsed.path or "/") else request.rel_url.raw_query_string
+        if not websocket and path == (parsed.path or "/"):
+            query = parsed.query
+        else:
+            query = request.rel_url.raw_query_string
         scheme = ("wss" if parsed.scheme == "https" else "ws") if websocket else parsed.scheme
         return urlunsplit((scheme, parsed.netloc, path, query, ""))
 

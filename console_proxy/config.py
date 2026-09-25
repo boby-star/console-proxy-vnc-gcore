@@ -9,6 +9,7 @@ class Config:
     register_api_token: str = os.getenv("REGISTER_API_TOKEN", "")
     session_ttl_seconds: int = int(os.getenv("SESSION_TTL_SECONDS", "3000"))
     prefetch_provider_cookies: bool = os.getenv("PREFETCH_PROVIDER_COOKIES", "true").lower() in ("1", "true", "yes")
+    ovh_upstream_connection_limit: int = int(os.getenv("OVH_UPSTREAM_CONNECTION_LIMIT", "2000"))
     allowed_host_suffixes: list[str] = field(default_factory=lambda: [
         s.strip().lower() for s in os.getenv("ALLOWED_HOST_SUFFIXES", "cloud.gcore.com,ipmi.ovh.net").split(",") if s.strip()
     ])

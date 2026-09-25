@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import redis.asyncio as redis
-from aiohttp import web
+from aiohttp import ClientSession, DummyCookieJar, TCPConnector, web
 
 from .config import Config
 from .cookies import ProviderCookieService
@@ -11,6 +11,7 @@ from .handlers.register import RegisterHandler
 from .handlers.register_dispatcher import ConsoleRegisterDispatcher
 from .handlers.serial import SerialConsoleHandler
 from .logging_utils import request_id_middleware, setup_logging
+from .ovh_ipmi.browser_session import OvhIpmiBrowserSession
 from .ovh_ipmi.cookies import OvhIpmiCookieService
 from .ovh_ipmi.handlers import OvhIpmiConsoleHandler, OvhIpmiRegisterHandler
 from .ovh_ipmi.http_proxy import OvhIpmiHTTPProxy
@@ -30,6 +31,8 @@ async def on_startup(app: web.Application) -> None:
 
 
 async def on_cleanup(app: web.Application) -> None:
+    if "ovh_ipmi_client" in app:
+        await app["ovh_ipmi_client"].close()
     await app["redis"].aclose()
 
 
@@ -47,12 +50,19 @@ async def init_services(app: web.Application) -> None:
     ovh_validator = OvhIpmiURLValidator()
     ovh_builder = OvhIpmiURLBuilder(config.public_base_url, ovh_validator)
     ovh_cookies = OvhIpmiCookieService(redis_client, config)
+    ovh_browser_session = OvhIpmiBrowserSession(redis_client, config)
     ovh_lease = OvhIpmiLease(redis_client, config)
+    app["ovh_ipmi_client"] = ClientSession(
+        timeout=config.http_timeout,
+        cookie_jar=DummyCookieJar(),
+        auto_decompress=False,
+        connector=TCPConnector(limit=config.ovh_upstream_connection_limit),
+    )
     ovh_http_proxy = OvhIpmiHTTPProxy(
-        config, ovh_builder, ovh_cookies, ovh_lease
+        config, ovh_builder, ovh_cookies, ovh_lease, app["ovh_ipmi_client"]
     )
     ovh_websocket_bridge = OvhIpmiWebSocketBridge(
-        config, ovh_builder, ovh_cookies, ovh_lease
+        config, ovh_builder, ovh_cookies, ovh_lease, app["ovh_ipmi_client"]
     )
     ovh_register_handler = OvhIpmiRegisterHandler(
         config, ovh_validator, ovh_builder, store, ovh_cookies
@@ -72,7 +82,8 @@ async def init_services(app: web.Application) -> None:
         config, store, validator, claims, websocket_bridge
     )
     app["ovh_ipmi_handler"] = OvhIpmiConsoleHandler(
-        store, ovh_validator, claims, ovh_http_proxy, ovh_websocket_bridge
+        store, ovh_validator, ovh_browser_session, ovh_http_proxy,
+        ovh_websocket_bridge,
     )
 
 
@@ -118,6 +129,9 @@ def create_app() -> web.Application:
     async def ovh_ipmi(request: web.Request) -> web.StreamResponse:
         return await request.app["ovh_ipmi_handler"].handle(request)
 
+    async def ovh_ipmi_root(request: web.Request) -> web.StreamResponse:
+        return await request.app["ovh_ipmi_handler"].handle_root(request)
+
     app.router.add_get("/health", health)
     app.router.add_get("/ready", ready)
     app.router.add_post("/api/console/register", register)
@@ -127,4 +141,5 @@ def create_app() -> web.Application:
     app.router.add_route("*", "/ipmi/{token}", ovh_ipmi)
     app.router.add_route("*", "/p/{token}/{tail:.*}", novnc)
     app.router.add_route("*", "/p/{token}", novnc)
+    app.router.add_route("*", "/{tail:.*}", ovh_ipmi_root)
     return app

@@ -48,24 +48,41 @@ class OvhIpmiRegisterHandler:
 
 
 class OvhIpmiConsoleHandler:
-    def __init__(self, store, validator, claims, http_proxy, websocket_bridge):
+    def __init__(
+        self, store, validator, browser_session, http_proxy, websocket_bridge
+    ):
         self.store = store
         self.validator = validator
-        self.claims = claims
+        self.browser_session = browser_session
         self.http_proxy = http_proxy
         self.websocket_bridge = websocket_bridge
 
     async def handle(self, request):
         token = request.match_info["token"]
+        return await self._handle(request, token, explicit_session=True)
+
+    async def handle_root(self, request):
+        token = await self.browser_session.resolve(request)
+        return await self._handle(request, token, explicit_session=False)
+
+    async def _handle(self, request, token, explicit_session):
         log = RequestLogger(request)
         session = await self.store.load(token, log)
         if session.mode != "ipmi":
             raise web.HTTPForbidden(text="Invalid OVH IPMI session")
         self.validator.validate(session.upstream_url)
         if request.headers.get("Upgrade", "").lower() == "websocket":
-            await self.claims.require_existing_claim(request, token, log)
-            return await self.websocket_bridge.bridge(request, token, session, log)
-        should_set_claim, claim_id = await self.claims.ensure_claimed(request, token, log)
+            if explicit_session:
+                bound_token = await self.browser_session.resolve(request)
+                if bound_token != token:
+                    raise web.HTTPForbidden(text="IPMI session belongs to another browser")
+            return await self.websocket_bridge.bridge(
+                request, token, session, log, explicit_session
+            )
+        if explicit_session:
+            browser_id = await self.browser_session.bind(request, token)
+        else:
+            browser_id = request.cookies.get(self.browser_session.COOKIE_NAME)
         return await self.http_proxy.proxy(
-            request, token, session, should_set_claim, claim_id, log
+            request, token, session, browser_id, log, explicit_session
         )

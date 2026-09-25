@@ -1,6 +1,7 @@
 from http.cookies import SimpleCookie
 
 from ..cookies import ProviderCookieService
+from .browser_session import IPMI_BROWSER_COOKIE
 
 
 class OvhIpmiCookieService(ProviderCookieService):
@@ -8,9 +9,15 @@ class OvhIpmiCookieService(ProviderCookieService):
         header = await super().build_header(token, client_cookie_header)
         if not header:
             return None
-        claim_prefix = self.config.claim_cookie_name + "="
+        internal_names = {
+            self.config.claim_cookie_name,
+            IPMI_BROWSER_COOKIE,
+        }
         cookies = [part.strip() for part in header.split(";")]
-        cookies = [part for part in cookies if not part.startswith(claim_prefix)]
+        cookies = [
+            part for part in cookies
+            if part.partition("=")[0] not in internal_names
+        ]
         return "; ".join(cookies) or None
 
     def rewrite_for_client(self, headers, token):
@@ -24,7 +31,7 @@ class OvhIpmiCookieService(ProviderCookieService):
             for name, morsel in cookie.items():
                 parts = [
                     f"{name}={morsel.coded_value}",
-                    f"Path=/ipmi/{token}/",
+                    "Path=/",
                     "Secure",
                     "SameSite=None",
                 ]
@@ -50,9 +57,8 @@ class OvhIpmiCookieService(ProviderCookieService):
         for name, value in jar.items():
             cookie = SimpleCookie()
             cookie[name] = value
-            cookie[name]["path"] = f"/ipmi/{token}/"
+            cookie[name]["path"] = "/"
             cookie[name]["secure"] = True
-            cookie[name]["httponly"] = True
             cookie[name]["samesite"] = "None"
             result.append(cookie.output(header="").strip())
         return result

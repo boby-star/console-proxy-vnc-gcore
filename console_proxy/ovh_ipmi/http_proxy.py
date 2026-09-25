@@ -1,10 +1,11 @@
 import time
 from urllib.parse import urlsplit
 
-from aiohttp import ClientError, ClientSession, DummyCookieJar, web
+from aiohttp import ClientError, web
 
 from ..logging_utils import safe_url
-from .html_filter import filter_html, rewrite_provider_identity, rewrite_root_relative_urls
+from .browser_session import IPMI_BROWSER_COOKIE
+from .html_filter import filter_html, rewrite_provider_identity
 
 
 HOP_HEADERS = {
@@ -38,107 +39,99 @@ def classify_rewritable_response(content_type, target_url):
 
 
 class OvhIpmiHTTPProxy:
-    def __init__(self, config, url_builder, cookies, lease):
+    def __init__(self, config, url_builder, cookies, lease, client):
         self.config = config
         self.url_builder = url_builder
         self.cookies = cookies
         self.lease = lease
+        self.client = client
 
-    async def proxy(self, request, token, session, set_claim_cookie, claim_id, log):
-        await self.lease.refresh(token)
-        target = self.url_builder.make_upstream_url(session.upstream_url, request, token)
+    async def proxy(self, request, token, session, browser_id, log, prefixed=True):
+        await self.lease.refresh(token, browser_id)
+        target = self.url_builder.make_upstream_url(
+            session.upstream_url, request, token, prefixed=prefixed
+        )
         public_host = urlsplit(self.config.public_base_url).netloc
         started = time.monotonic()
         log.info("ovh_ipmi_http_start", upstream=safe_url(target))
         cookie = await self.cookies.build_header(token, request.headers.get("Cookie"))
-        headers = self._request_headers(request, session.upstream_url, cookie)
+        headers = self._request_headers(request, session.upstream_url, cookie, token)
         data = request.content.iter_chunked(65536) if request.can_read_body else None
         try:
-            async with ClientSession(
-                timeout=self.config.http_timeout,
-                cookie_jar=DummyCookieJar(),
-                auto_decompress=False,
-            ) as client:
-                async with client.request(
-                    request.method,
-                    target,
-                    headers=headers,
-                    data=data,
-                    allow_redirects=False,
-                ) as upstream:
-                    set_cookies = upstream.headers.getall("Set-Cookie", [])
-                    await self.cookies.save(token, set_cookies)
-                    response_headers = self._response_headers(
-                        upstream.headers, token, session.upstream_url, public_host
-                    )
-                    response = web.StreamResponse(
-                        status=upstream.status,
-                        reason=upstream.reason,
-                        headers=response_headers,
-                    )
-                    for header in self.cookies.rewrite_for_client(set_cookies, token):
-                        response.headers.add("Set-Cookie", header)
-                    for header in await self.cookies.stored_for_client(token):
-                        response.headers.add("Set-Cookie", header)
-                    if set_claim_cookie and claim_id:
-                        response.set_cookie(
-                            self.config.claim_cookie_name,
-                            claim_id,
-                            path=f"/ipmi/{token}/",
-                            max_age=self.config.session_ttl_seconds,
-                            secure=True,
-                            httponly=True,
-                            samesite="None",
-                        )
+            async with self.client.request(
+                request.method,
+                target,
+                headers=headers,
+                data=data,
+                allow_redirects=False,
+            ) as upstream:
+                set_cookies = upstream.headers.getall("Set-Cookie", [])
+                await self.cookies.save(token, set_cookies)
+                response_headers = self._response_headers(
+                    upstream.headers, token, session.upstream_url, public_host
+                )
+                response = web.StreamResponse(
+                    status=upstream.status,
+                    reason=upstream.reason,
+                    headers=response_headers,
+                )
+                for header in self.cookies.rewrite_for_client(set_cookies, token):
+                    response.headers.add("Set-Cookie", header)
+                response.set_cookie(
+                    IPMI_BROWSER_COOKIE,
+                    browser_id,
+                    path="/",
+                    max_age=self.config.session_ttl_seconds,
+                    secure=True,
+                    httponly=True,
+                    samesite="Lax",
+                )
 
-                    is_html, is_rewritable_asset = classify_rewritable_response(
-                        upstream.headers.get("Content-Type", ""), target
-                    )
-                    rewrite_body = (
-                        (is_html or is_rewritable_asset)
-                        and not upstream.headers.get("Content-Encoding")
-                    )
-                    if rewrite_body:
-                        upstream_netloc = urlsplit(session.upstream_url).netloc
-                        body = await upstream.read()
-                        if is_html:
-                            body = filter_html(
-                                body, token, upstream_netloc, public_host
-                            )
-                        else:
-                            body = rewrite_provider_identity(
-                                body, token, upstream_netloc, public_host
-                            )
-                            body = rewrite_root_relative_urls(body, token)
-                        response.headers.pop("Content-Length", None)
-                        response.headers.pop("ETag", None)
-                        response.headers.pop("Content-MD5", None)
-                        response.headers.pop("Accept-Ranges", None)
-                        response.headers.pop("Last-Modified", None)
-                        response.headers["Cache-Control"] = "no-store"
-                        response.headers["X-Console-Proxy-Rewritten"] = (
-                            "html" if is_html else "asset"
-                        )
-                        response.content_length = len(body)
-
-                    await response.prepare(request)
-                    if rewrite_body:
-                        await response.write(body)
+                is_html, is_rewritable_asset = classify_rewritable_response(
+                    upstream.headers.get("Content-Type", ""), target
+                )
+                rewrite_body = (
+                    (is_html or is_rewritable_asset)
+                    and not upstream.headers.get("Content-Encoding")
+                )
+                if rewrite_body:
+                    upstream_netloc = urlsplit(session.upstream_url).netloc
+                    body = await upstream.read()
+                    if is_html:
+                        body = filter_html(body, upstream_netloc, public_host)
                     else:
-                        async for chunk in upstream.content.iter_chunked(65536):
-                            await response.write(chunk)
-                    await response.write_eof()
-                    log.info(
-                        "ovh_ipmi_http_done",
-                        upstream_status=upstream.status,
-                        duration_ms=int((time.monotonic() - started) * 1000),
+                        body = rewrite_provider_identity(
+                            body, upstream_netloc, public_host
+                        )
+                    response.headers.pop("Content-Length", None)
+                    response.headers.pop("ETag", None)
+                    response.headers.pop("Content-MD5", None)
+                    response.headers.pop("Accept-Ranges", None)
+                    response.headers.pop("Last-Modified", None)
+                    response.headers["Cache-Control"] = "no-store"
+                    response.headers["X-Console-Proxy-Rewritten"] = (
+                        "html" if is_html else "asset"
                     )
-                    return response
+                    response.content_length = len(body)
+
+                await response.prepare(request)
+                if rewrite_body:
+                    await response.write(body)
+                else:
+                    async for chunk in upstream.content.iter_chunked(65536):
+                        await response.write(chunk)
+                await response.write_eof()
+                log.info(
+                    "ovh_ipmi_http_done",
+                    upstream_status=upstream.status,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                )
+                return response
         except ClientError:
             log.exception("ovh_ipmi_http_failure", upstream=safe_url(target))
             raise web.HTTPBadGateway(text="Upstream IPMI HTTP request failed")
 
-    def _request_headers(self, request, upstream_url, cookie):
+    def _request_headers(self, request, upstream_url, cookie, token=None):
         parsed = urlsplit(upstream_url)
         headers = {
             key: value for key, value in request.headers.items()
@@ -149,7 +142,14 @@ class OvhIpmiHTTPProxy:
         if request.headers.get("Origin"):
             headers["Origin"] = self.url_builder.upstream_origin(upstream_url)
         if request.headers.get("Referer"):
-            headers["Referer"] = upstream_url
+            referer = urlsplit(request.headers["Referer"])
+            referer_path = referer.path or "/"
+            prefix = f"/ipmi/{token}" if token else None
+            if prefix and referer_path.startswith(prefix):
+                referer_path = referer_path[len(prefix):] or "/"
+            headers["Referer"] = self.url_builder.upstream_origin(upstream_url) + (
+                referer_path
+            ) + (("?" + referer.query) if referer.query else "")
         if cookie:
             headers["Cookie"] = cookie
         return headers
