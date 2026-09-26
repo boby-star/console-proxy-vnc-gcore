@@ -56,12 +56,13 @@ def classify_rewritable_response(content_type, target_url):
 
 
 class OvhIpmiHTTPProxy:
-    def __init__(self, config, url_builder, cookies, lease, client):
+    def __init__(self, config, url_builder, cookies, lease, client, auth_adapter=None):
         self.config = config
         self.url_builder = url_builder
         self.cookies = cookies
         self.lease = lease
         self.client = client
+        self.auth_adapter = auth_adapter
 
     async def proxy(self, request, token, session, browser_id, log, prefixed=True):
         await self.lease.refresh(token, browser_id)
@@ -78,12 +79,27 @@ class OvhIpmiHTTPProxy:
         # control requests are bounded by aiohttp's client_max_size; Virtual
         # Media itself is transferred by WebSocket and remains streaming.
         data = await request.read() if request.can_read_body else None
+        upstream_path = urlsplit(target).path
+        auth_body_normalized = bool(
+            self.auth_adapter
+            and request.method == "POST"
+            and upstream_path == self.auth_adapter.LOGIN_PATH
+        )
+        if self.auth_adapter:
+            headers, data = self.auth_adapter.prepare_request(
+                request,
+                session.upstream_url,
+                upstream_path,
+                headers,
+                data,
+            )
         log.info(
             "ovh_ipmi_http_start",
             upstream=safe_url(target),
             has_provider_cookie=bool(cookie),
             has_csrf_header=any(key.lower() == "x-csrftoken" for key in headers),
             request_body_bytes=len(data) if data is not None else 0,
+            auth_body_normalized=auth_body_normalized,
         )
         try:
             async with self.client.request(
