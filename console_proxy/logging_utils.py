@@ -4,6 +4,21 @@ from aiohttp import web
 
 SENSITIVE_HEADERS = {"cookie", "x-proxy-token", "authorization"}
 
+class SafeAccessLogger(AbstractAccessLogger):
+    """Access logger that never writes query-string credentials."""
+
+    def log(self, request, response, time):
+        self.logger.info(
+            "http_access remote_ip=%s method=%s path=%s status=%s "
+            "duration_ms=%s user_agent=%s",
+            request.remote,
+            request.method,
+            request.path,
+            response.status,
+            int(time * 1000),
+            request.headers.get("User-Agent", ""),
+        )
+
 def setup_logging():
     logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(asctime)s level=%(levelname)s event=%(message)s")
 

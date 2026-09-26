@@ -6,6 +6,7 @@ from aiohttp import ClientError, WSMsgType, WSServerHandshakeError, web
 
 from ..logging_utils import safe_url
 from .browser_session import IPMI_BROWSER_COOKIE
+from .http_proxy import is_forwardable_request_header
 
 
 class OvhIpmiWebSocketBridge:
@@ -136,7 +137,7 @@ class OvhIpmiWebSocketBridge:
         }
         headers = {
             key: value for key, value in request.headers.items()
-            if key.lower() not in skip
+            if key.lower() not in skip and is_forwardable_request_header(key)
         }
         headers["Host"] = parsed.netloc
         headers["Origin"] = self.url_builder.upstream_origin(upstream_url)

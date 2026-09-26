@@ -13,10 +13,27 @@ HOP_HEADERS = {
     "te", "trailers", "transfer-encoding", "upgrade",
 }
 REQUEST_SKIP = HOP_HEADERS | {"host", "cookie", "origin", "referer"}
+REQUEST_SKIP |= {
+    "cf-connecting-ip",
+    "cf-ipcountry",
+    "cf-ray",
+    "forwarded",
+    "true-client-ip",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-port",
+    "x-forwarded-proto",
+    "x-real-ip",
+}
 RESPONSE_SKIP = HOP_HEADERS | {
     "set-cookie", "content-security-policy", "content-security-policy-report-only",
     "x-frame-options",
 }
+
+
+def is_forwardable_request_header(name):
+    lowered = name.lower()
+    return lowered not in REQUEST_SKIP and not lowered.startswith("x-forwarded-")
 
 
 def classify_rewritable_response(content_type, target_url):
@@ -53,10 +70,21 @@ class OvhIpmiHTTPProxy:
         )
         public_host = urlsplit(self.config.public_base_url).netloc
         started = time.monotonic()
-        log.info("ovh_ipmi_http_start", upstream=safe_url(target))
         cookie = await self.cookies.build_header(token, request.headers.get("Cookie"))
         headers = self._request_headers(request, session.upstream_url, cookie, token)
-        data = request.content.iter_chunked(65536) if request.can_read_body else None
+        # ASRock's embedded HTTP server does not reliably parse chunked request
+        # bodies. aiohttp uses chunked transfer encoding for an async iterator,
+        # which made /api/viewerlogin see an empty token and return 401. HTTP
+        # control requests are bounded by aiohttp's client_max_size; Virtual
+        # Media itself is transferred by WebSocket and remains streaming.
+        data = await request.read() if request.can_read_body else None
+        log.info(
+            "ovh_ipmi_http_start",
+            upstream=safe_url(target),
+            has_provider_cookie=bool(cookie),
+            has_csrf_header=any(key.lower() == "x-csrftoken" for key in headers),
+            request_body_bytes=len(data) if data is not None else 0,
+        )
         try:
             async with self.client.request(
                 request.method,
@@ -135,7 +163,7 @@ class OvhIpmiHTTPProxy:
         parsed = urlsplit(upstream_url)
         headers = {
             key: value for key, value in request.headers.items()
-            if key.lower() not in REQUEST_SKIP
+            if is_forwardable_request_header(key)
         }
         headers["Host"] = parsed.netloc
         headers["Accept-Encoding"] = "identity"
