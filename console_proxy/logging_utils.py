@@ -1,6 +1,7 @@
 import hashlib, logging, sys, uuid
 from urllib.parse import urlsplit, parse_qsl
 from aiohttp import web
+from aiohttp.abc import AbstractAccessLogger
 
 SENSITIVE_HEADERS = {"cookie", "x-proxy-token", "authorization"}
 
