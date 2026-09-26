@@ -11,6 +11,7 @@ from .handlers.register import RegisterHandler
 from .handlers.register_dispatcher import ConsoleRegisterDispatcher
 from .handlers.serial import SerialConsoleHandler
 from .logging_utils import request_id_middleware, setup_logging
+from .ovh_ipmi.auth_adapter import AsrockAuthAdapter
 from .ovh_ipmi.browser_session import OvhIpmiBrowserSession
 from .ovh_ipmi.cookies import OvhIpmiCookieService
 from .ovh_ipmi.handlers import OvhIpmiConsoleHandler, OvhIpmiRegisterHandler
