@@ -59,7 +59,12 @@ async def init_services(app: web.Application) -> None:
         connector=TCPConnector(limit=config.ovh_upstream_connection_limit),
     )
     ovh_http_proxy = OvhIpmiHTTPProxy(
-        config, ovh_builder, ovh_cookies, ovh_lease, app["ovh_ipmi_client"]
+        config,
+        ovh_builder,
+        ovh_cookies,
+        ovh_lease,
+        app["ovh_ipmi_client"],
+        AsrockAuthAdapter(),
     )
     ovh_websocket_bridge = OvhIpmiWebSocketBridge(
         config, ovh_builder, ovh_cookies, ovh_lease, app["ovh_ipmi_client"]
