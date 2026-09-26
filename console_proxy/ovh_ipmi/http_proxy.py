@@ -69,6 +69,14 @@ class OvhIpmiHTTPProxy:
         target = self.url_builder.make_upstream_url(
             session.upstream_url, request, token, prefixed=prefixed
         )
+        upstream_path = urlsplit(target).path
+        session_path = urlsplit(session.upstream_url).path or "/"
+        is_bootstrap = prefixed and upstream_path == session_path
+        bootstrap_cookies = []
+        if is_bootstrap:
+            bootstrap_cookies = await self.cookies.initialize_bootstrap(
+                token, session.upstream_url
+            )
         public_host = urlsplit(self.config.public_base_url).netloc
         started = time.monotonic()
         cookie = await self.cookies.build_header(token, request.headers.get("Cookie"))
@@ -79,7 +87,6 @@ class OvhIpmiHTTPProxy:
         # control requests are bounded by aiohttp's client_max_size; Virtual
         # Media itself is transferred by WebSocket and remains streaming.
         data = await request.read() if request.can_read_body else None
-        upstream_path = urlsplit(target).path
         auth_body_normalized = bool(
             self.auth_adapter
             and request.method == "POST"
@@ -120,6 +127,8 @@ class OvhIpmiHTTPProxy:
                     headers=response_headers,
                 )
                 for header in self.cookies.rewrite_for_client(set_cookies, token):
+                    response.headers.add("Set-Cookie", header)
+                for header in bootstrap_cookies:
                     response.headers.add("Set-Cookie", header)
                 response.set_cookie(
                     IPMI_BROWSER_COOKIE,

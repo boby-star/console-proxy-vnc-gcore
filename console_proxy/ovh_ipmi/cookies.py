@@ -1,24 +1,59 @@
+import json
 from http.cookies import SimpleCookie
+from urllib.parse import parse_qs, urlsplit
 
 from ..cookies import ProviderCookieService
 from .browser_session import IPMI_BROWSER_COOKIE
 
 
 class OvhIpmiCookieService(ProviderCookieService):
+    async def initialize_bootstrap(self, token, upstream_url):
+        """Seed the ASRock cookies before the one-time bootstrap request."""
+        query = parse_qs(urlsplit(upstream_url).query, keep_blank_values=True)
+        provider_token = query.get("token", [None])[0]
+        if not provider_token:
+            return []
+        jar = {
+            "QSESSIONID": provider_token,
+            "refresh_disable": "1",
+        }
+        await self.redis.set(
+            f"{self.config.cookie_key_prefix}{token}",
+            json.dumps(jar),
+            ex=self.config.session_ttl_seconds,
+            nx=True,
+        )
+        return self._jar_for_client(jar)
+
     async def build_header(self, token, client_cookie_header):
-        header = await super().build_header(token, client_cookie_header)
-        if not header:
-            return None
         internal_names = {
             self.config.claim_cookie_name,
             IPMI_BROWSER_COOKIE,
         }
-        cookies = [part.strip() for part in header.split(";")]
-        cookies = [
-            part for part in cookies
-            if part.partition("=")[0] not in internal_names
-        ]
-        return "; ".join(cookies) or None
+        jar = {}
+        if client_cookie_header:
+            client = SimpleCookie()
+            try:
+                client.load(client_cookie_header)
+            except Exception:
+                pass
+            else:
+                jar.update({
+                    name: morsel.value
+                    for name, morsel in client.items()
+                    if name not in internal_names
+                })
+
+        # Redis is scoped by proxy session and is authoritative. In particular,
+        # it must override a stale root-scoped QSESSIONID left by another IPMI
+        # console on the same public domain.
+        raw = await self.redis.get(f"{self.config.cookie_key_prefix}{token}")
+        if raw:
+            try:
+                jar.update(json.loads(raw))
+            except Exception:
+                pass
+        return "; ".join(f"{name}={value}" for name, value in jar.items()) or None
 
     def rewrite_for_client(self, headers, token):
         rewritten = []
@@ -48,11 +83,14 @@ class OvhIpmiCookieService(ProviderCookieService):
         raw = await self.redis.get(f"{self.config.cookie_key_prefix}{token}")
         if not raw:
             return []
-        import json
         try:
             jar = json.loads(raw)
         except Exception:
             return []
+        return self._jar_for_client(jar)
+
+    @staticmethod
+    def _jar_for_client(jar):
         result = []
         for name, value in jar.items():
             cookie = SimpleCookie()
